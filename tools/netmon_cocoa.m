@@ -791,39 +791,63 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     [hdr addSubview:_startBtn];
 
     // ---- Main content (below header) ----
+    // Layout:
+    //  _mainSplit  (VERTICAL)
+    //  ├── colonna sinistra: _leftSplit (HORIZONTAL)
+    //  │   ├── [alto]  log scroll view
+    //  │   └── [basso] eventi scroll view
+    //  └── colonna destra: _statsView (piena altezza)
     float contentH = WIN_H - HEADER_H;
 
+    // Split principale sinistra/destra
     _mainSplit = [[NSSplitView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W, contentH)];
-    _mainSplit.vertical = NO;
+    _mainSplit.vertical = YES;   // ← divide orizzontalmente lo spazio
     _mainSplit.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     _mainSplit.dividerStyle = NSSplitViewDividerStyleThin;
     _mainSplit.delegate = self;
     [cv addSubview:_mainSplit];
 
-    // Top: log + stats side by side
-    _topSplit = [[NSSplitView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W, contentH * 0.65)];
-    _topSplit.vertical = YES;
+    // Colonna sinistra: log + eventi impilati
+    _topSplit = [[NSSplitView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W * 0.68, contentH)];
+    _topSplit.vertical = NO;   // ← divide verticalmente
     _topSplit.dividerStyle = NSSplitViewDividerStyleThin;
     _topSplit.delegate = self;
     [_mainSplit addSubview:_topSplit];
 
-    // Log panel (left)
+    // Log (alto)
     NSScrollView *logSV = [self makeLogPane:&_logTV];
-    logSV.frame = NSMakeRect(0, 0, WIN_W * 0.62, contentH * 0.65);
+    logSV.frame = NSMakeRect(0, 0, WIN_W * 0.68, contentH * 0.65);
     [_topSplit addSubview:logSV];
 
-    // Stats panel (right) — custom drawRect, si riscala correttamente
-    _statsView = [[NMStatsView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W * 0.38, contentH * 0.65)];
-    _statsView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [_topSplit addSubview:_statsView];
+    // Intestazione pane eventi (wrapper con titolo)
+    NSView *evWrapper = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W * 0.68, contentH * 0.35)];
+    evWrapper.wantsLayer = YES;
+    evWrapper.layer.backgroundColor = [[NSColor colorWithRed:0.06 green:0.07 blue:0.10 alpha:1] CGColor];
+    [_topSplit addSubview:evWrapper];
 
-    // Events pane (bottom)
+    NSDictionary *evTitleA = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:8],
+        NSForegroundColorAttributeName: [NSColor colorWithWhite:0.33 alpha:1],
+        NSKernAttributeName: @(2.0) };
+    NSTextField *evTitle = [NSTextField labelWithString:@""];
+    evTitle.attributedStringValue = [[NSAttributedString alloc]
+        initWithString:@"EVENTI CONNESSIONE" attributes:evTitleA];
+    evTitle.frame = NSMakeRect(12, contentH * 0.35 - 20, 200, 14);
+    evTitle.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    [evWrapper addSubview:evTitle];
+
     NSScrollView *evSV = [self makeLogPane:&_evTV];
-    evSV.frame = NSMakeRect(0, 0, WIN_W, contentH * 0.35);
-    [_mainSplit addSubview:evSV];
+    evSV.frame = NSMakeRect(0, 0, WIN_W * 0.68, contentH * 0.35 - 22);
+    evSV.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [evWrapper addSubview:evSV];
 
-    [_mainSplit setPosition:contentH * 0.65 ofDividerAtIndex:0];
-    [_topSplit  setPosition:WIN_W * 0.62    ofDividerAtIndex:0];
+    // Colonna destra: stats a piena altezza
+    _statsView = [[NMStatsView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W * 0.32, contentH)];
+    _statsView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [_mainSplit addSubview:_statsView];
+
+    [_mainSplit setPosition:WIN_W * 0.68    ofDividerAtIndex:0];
+    [_topSplit  setPosition:contentH * 0.65 ofDividerAtIndex:0];
 
     [_win makeKeyAndOrderFront:nil];
     [_win makeFirstResponder:_startBtn];
@@ -959,11 +983,14 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 
 // ---- NSSplitView delegate (prevent collapse) ----
 - (CGFloat)splitView:(NSSplitView *)sv constrainMinCoordinate:(CGFloat)p ofSubviewAt:(NSInteger)i {
-    return (sv == _topSplit) ? 420 : 200;
+    if (sv == _mainSplit) return 500;   // colonna sinistra: minimo 500pt larghezza
+    if (sv == _topSplit)  return 120;   // log: minimo 120pt altezza
+    return 120;
 }
 - (CGFloat)splitView:(NSSplitView *)sv constrainMaxCoordinate:(CGFloat)p ofSubviewAt:(NSInteger)i {
-    if (sv == _topSplit) return sv.frame.size.width - 280;
-    return sv.frame.size.height - 160;
+    if (sv == _mainSplit) return sv.frame.size.width - 260; // stats: minimo 260pt larghezza
+    if (sv == _topSplit)  return sv.frame.size.height - 80; // eventi: minimo 80pt
+    return p;
 }
 @end
 
