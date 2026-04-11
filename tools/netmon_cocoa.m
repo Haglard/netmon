@@ -505,6 +505,169 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 }
 @end
 
+// ===================== NMStatsView =====================
+@interface NMStatsView : NSView {
+    NMStatsSnap _snap;
+    NMSample    _sample;
+    BOOL        _hasSample;
+    BOOL        _isUp;
+}
+- (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up;
+@end
+
+@implementation NMStatsView
+- (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up {
+    _snap = snap; _sample = s; _hasSample = YES; _isUp = up;
+    [self setNeedsDisplay:YES];
+}
+- (void)drawRect:(NSRect)__unused dirty {
+    float W = self.bounds.size.width;
+    float x = 16, pw = W - 32;
+    __block float y = self.bounds.size.height - 20;
+
+    // Sfondo
+    [[NSColor colorWithRed:0.07 green:0.09 blue:0.15 alpha:1] setFill];
+    NSRectFill(self.bounds);
+
+    // Palette colori
+    NSColor *colBright = [NSColor colorWithWhite:0.92 alpha:1];
+    NSColor *colMid    = [NSColor colorWithWhite:0.60 alpha:1];
+    NSColor *colDim    = [NSColor colorWithWhite:0.33 alpha:1];
+    NSColor *colGreen  = [NSColor colorWithRed:0.28 green:0.88 blue:0.44 alpha:1];
+    NSColor *colRed    = [NSColor colorWithRed:1.00 green:0.30 blue:0.30 alpha:1];
+    NSColor *colOrange = [NSColor colorWithRed:1.00 green:0.62 blue:0.10 alpha:1];
+    NSColor *colSep    = [NSColor colorWithWhite:0.18 alpha:1];
+    NSColor *colAccent = [NSColor colorWithRed:0.32 green:0.62 blue:1.00 alpha:1];
+
+    // Attributi testo
+    NSDictionary *titleA = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:13],
+        NSForegroundColorAttributeName: colAccent };
+    NSDictionary *sectionA = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:8],
+        NSForegroundColorAttributeName: colDim,
+        NSKernAttributeName: @(2.2) };
+    NSDictionary *labelA = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:11],
+        NSForegroundColorAttributeName: colMid };
+
+    // Helper: riga label sx / valore dx colorato
+    void (^row)(NSString *, NSString *, NSColor *) = ^(NSString *lbl, NSString *val, NSColor *vc) {
+        [lbl drawAtPoint:NSMakePoint(x, y) withAttributes:labelA];
+        if (val) {
+            NSDictionary *va = @{
+                NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium],
+                NSForegroundColorAttributeName: vc ?: colBright };
+            NSSize vs = [val sizeWithAttributes:va];
+            [val drawAtPoint:NSMakePoint(x + pw - vs.width, y) withAttributes:va];
+        }
+        y -= 18;
+    };
+
+    // Helper: separatore + intestazione sezione
+    void (^section)(NSString *) = ^(NSString *title) {
+        y -= 5;
+        [colSep setFill]; NSRectFill(NSMakeRect(x, y + 7, pw, 1));
+        y -= 15;
+        [title drawAtPoint:NSMakePoint(x, y) withAttributes:sectionA];
+        y -= 14;
+    };
+
+    // Formattatore ms
+    NSString *(^ms)(double) = ^(double v) {
+        return v < 0 ? @"—" : [NSString stringWithFormat:@"%.0f ms", v];
+    };
+
+    // ---- Titolo ----
+    [@"VIBE NETMON" drawAtPoint:NSMakePoint(x, y) withAttributes:titleA];
+    y -= 22;
+
+    // ---- Dot stato ----
+    NSColor *dotCol = _isUp ? colGreen : colRed;
+    NSDictionary *dotA = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:12],
+        NSForegroundColorAttributeName: dotCol };
+    [(_isUp ? @"● UP" : @"● DOWN") drawAtPoint:NSMakePoint(x, y) withAttributes:dotA];
+    y -= 24;
+
+    if (!_hasSample) {
+        NSDictionary *wa = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:11],
+            NSForegroundColorAttributeName: colDim };
+        [@"In attesa del primo campione…" drawAtPoint:NSMakePoint(x, y) withAttributes:wa];
+        return;
+    }
+
+    // ---- Barra disponibilità ----
+    float barH = 18, barW = pw;
+    double avFrac = _snap.availability / 100.0;
+    [[NSColor colorWithRed:0.42 green:0.07 blue:0.07 alpha:1] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x, y, barW, barH) xRadius:5 yRadius:5] fill];
+    if (avFrac > 0.001) {
+        NSColor *bc = avFrac >= 0.999 ? [NSColor colorWithRed:0.10 green:0.55 blue:0.22 alpha:1]
+                    : avFrac >= 0.990 ? [NSColor colorWithRed:0.60 green:0.55 blue:0.05 alpha:1]
+                    :                   [NSColor colorWithRed:0.65 green:0.20 blue:0.05 alpha:1];
+        [bc setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x, y, barW * avFrac, barH)
+                                         xRadius:5 yRadius:5] fill];
+    }
+    NSString *avS = [NSString stringWithFormat:@"%.2f%%", _snap.availability];
+    NSDictionary *blA = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:10],
+        NSForegroundColorAttributeName: [NSColor colorWithWhite:0.95 alpha:1] };
+    NSSize bls = [avS sizeWithAttributes:blA];
+    [avS drawAtPoint:NSMakePoint(x + barW/2 - bls.width/2, y + (barH - bls.height)/2 + 1)
+      withAttributes:blA];
+    y -= (barH + 12);
+
+    // ---- CONNESSIONE ----
+    section(@"CONNESSIONE");
+    NSColor *avC = _snap.availability >= 99.9 ? colGreen
+                 : _snap.availability >= 99.0 ? colOrange : colRed;
+    row(@"Disponibilità",
+        [NSString stringWithFormat:@"%.2f%%", _snap.availability], avC);
+    row(@"Downtime",
+        _snap.downtimeSec <= 0 ? @"—" : [NSString stringWithFormat:@"%.0f s", _snap.downtimeSec],
+        _snap.downtimeSec > 0 ? colOrange : colMid);
+    row(@"Campioni",   [NSString stringWithFormat:@"%d", _snap.samples], nil);
+    row(@"Disc/Riconn",
+        [NSString stringWithFormat:@"%d / %d", _snap.disconnectEvents, _snap.reconnectEvents],
+        _snap.disconnectEvents > 0 ? colOrange : colMid);
+
+    // ---- LATENZE ----
+    section(@"LATENZE");
+    NSColor *(^latCol)(double) = ^(double v) {
+        return (v < 0 || v < 50) ? colGreen : (v < 150) ? colOrange : colRed;
+    };
+    row(@"GW mediana",   ms(_snap.gwMedian),   latCol(_snap.gwMedian));
+    row(@"ICMP mediana", ms(_snap.icmpMedian), latCol(_snap.icmpMedian));
+    row(@"ICMP p95",     ms(_snap.icmpP95),    latCol(_snap.icmpP95));
+    row(@"DNS mediano",  ms(_snap.dnsMedian),  latCol(_snap.dnsMedian));
+    row(@"HTTP mediano", ms(_snap.httpMedian), latCol(_snap.httpMedian));
+    row(@"HTTP p95",     ms(_snap.httpP95),    latCol(_snap.httpP95));
+
+    // ---- ULTIMO CAMPIONE ----
+    section(@"ULTIMO CAMPIONE");
+    NSColor *(^okC)(BOOL) = ^(BOOL ok) { return ok ? colGreen : colRed; };
+    row(@"Gateway",
+        [NSString stringWithFormat:@"%@  %@",
+         _sample.gateway_ok ? @"OK" : @"KO", ms(_sample.gateway_rtt)],
+        okC(_sample.gateway_ok));
+    row(@"ICMP",
+        [NSString stringWithFormat:@"%d/%d  %@",
+         _sample.icmp_ok, _sample.icmp_total, ms(_sample.icmp_median)],
+        _sample.icmp_ok == _sample.icmp_total ? colGreen : colOrange);
+    row(@"DNS",
+        [NSString stringWithFormat:@"%@  %@",
+         _sample.dns_ok ? @"OK" : @"KO", ms(_sample.dns_ms)],
+        okC(_sample.dns_ok));
+    row(@"HTTP",
+        [NSString stringWithFormat:@"%d/%d  %@",
+         _sample.http_ok, _sample.http_total, ms(_sample.http_median)],
+        _sample.http_ok == _sample.http_total ? colGreen : colOrange);
+}
+@end
+
 // ===================== AppDelegate (UI) =====================
 @interface AppDelegate : NSObject<NSApplicationDelegate, NSSplitViewDelegate> {
     NSWindow        *_win;
@@ -521,11 +684,7 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     NSTextView      *_logTV;
     NSTextView      *_evTV;
 
-    // Stats labels
-    NSTextField     *_lblAvail, *_lblDowntime, *_lblSamples;
-    NSTextField     *_lblDisconn, *_lblGW;
-    NSTextField     *_lblICMPMed, *_lblICMPP95;
-    NSTextField     *_lblDNS, *_lblHTTPMed, *_lblHTTMP95;
+    NMStatsView     *_statsView;
 
     NSSplitView     *_mainSplit, *_topSplit;
 }
@@ -653,38 +812,10 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     logSV.frame = NSMakeRect(0, 0, WIN_W * 0.62, contentH * 0.65);
     [_topSplit addSubview:logSV];
 
-    // Stats panel (right)
-    float pw = WIN_W * 0.38;
-    NSView *statsPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, pw, contentH * 0.65)];
-    statsPanel.wantsLayer = YES;
-    statsPanel.layer.backgroundColor = [[NSColor colorWithRed:0.08 green:0.10 blue:0.16 alpha:1] CGColor];
-    [_topSplit addSubview:statsPanel];
-
-    float sx = 14, sy = contentH * 0.65 - 32, sw = pw - 28;
-    NSTextField *stitle = [self makeLbl:@"STATISTICHE ORA CORRENTE" size:9 bold:YES];
-    stitle.frame = NSMakeRect(sx, sy, sw, 16);
-    stitle.textColor = [NSColor colorWithWhite:0.38 alpha:1];
-    stitle.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-    [statsPanel addSubview:stitle]; sy -= 22;
-
-    _lblAvail    = [self addRow:statsPanel label:@"Disponibilità"   x:sx y:&sy w:sw];
-    _lblDowntime = [self addRow:statsPanel label:@"Downtime"        x:sx y:&sy w:sw];
-    _lblSamples  = [self addRow:statsPanel label:@"Campioni"        x:sx y:&sy w:sw];
-    _lblDisconn  = [self addRow:statsPanel label:@"Disc. / Riconn." x:sx y:&sy w:sw];
-    sy -= 6;
-    _lblGW       = [self addRow:statsPanel label:@"GW latenza med." x:sx y:&sy w:sw];
-    _lblICMPMed  = [self addRow:statsPanel label:@"ICMP mediana"    x:sx y:&sy w:sw];
-    _lblICMPP95  = [self addRow:statsPanel label:@"ICMP p95"        x:sx y:&sy w:sw];
-    _lblDNS      = [self addRow:statsPanel label:@"DNS mediano"     x:sx y:&sy w:sw];
-    _lblHTTPMed  = [self addRow:statsPanel label:@"HTTP mediano"    x:sx y:&sy w:sw];
-    _lblHTTMP95  = [self addRow:statsPanel label:@"HTTP p95"        x:sx y:&sy w:sw];
-
-    // Separator
-    NSTextField *evtitle = [self makeLbl:@"EVENTI CONNESSIONE" size:9 bold:YES];
-    evtitle.frame = NSMakeRect(sx, 28, sw, 16);
-    evtitle.textColor = [NSColor colorWithWhite:0.38 alpha:1];
-    evtitle.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    [statsPanel addSubview:evtitle];
+    // Stats panel (right) — custom drawRect, si riscala correttamente
+    _statsView = [[NMStatsView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W * 0.38, contentH * 0.65)];
+    _statsView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [_topSplit addSubview:_statsView];
 
     // Events pane (bottom)
     NSScrollView *evSV = [self makeLogPane:&_evTV];
@@ -785,23 +916,8 @@ static NSArray *nm_sort(NSMutableArray *arr) {
         _statusLbl.textColor   = [NSColor systemRedColor];
     }
 
-    // Stats panel
-    NSString *(^ms)(double) = ^(double v) {
-        return v < 0 ? @"—" : [NSString stringWithFormat:@"%.1f ms", v];
-    };
-    _lblAvail.stringValue    = [NSString stringWithFormat:@"%.2f%%", snap.availability];
-    _lblAvail.textColor      = snap.availability < 99.0
-        ? [NSColor systemOrangeColor] : [NSColor colorWithRed:0.4 green:0.9 blue:0.5 alpha:1];
-    _lblDowntime.stringValue = [NSString stringWithFormat:@"%.0f s", snap.downtimeSec];
-    _lblSamples.stringValue  = [NSString stringWithFormat:@"%d", snap.samples];
-    _lblDisconn.stringValue  = [NSString stringWithFormat:@"%d / %d",
-                                snap.disconnectEvents, snap.reconnectEvents];
-    _lblGW.stringValue      = ms(snap.gwMedian);
-    _lblICMPMed.stringValue = ms(snap.icmpMedian);
-    _lblICMPP95.stringValue = ms(snap.icmpP95);
-    _lblDNS.stringValue     = ms(snap.dnsMedian);
-    _lblHTTPMed.stringValue = ms(snap.httpMedian);
-    _lblHTTMP95.stringValue = ms(snap.httpP95);
+    // Stats panel — aggiorna la custom view
+    [_statsView updateSnap:snap sample:s isUp:s.internet_up];
 }
 
 - (void)handleEvent:(NSString *)text isDown:(BOOL)isDown {
