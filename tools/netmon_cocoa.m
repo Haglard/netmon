@@ -11,6 +11,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <net/if_dl.h>
 
 // ===================== Globals (set in main) =====================
 static NSString *kOutputDir;
@@ -39,7 +42,36 @@ typedef struct {
     double http_median;   // ms; -1 = N/A
     BOOL   internet_up;
     char   notes[512];
+    double rx_bps;        // byte/s ricevuti nell'intervallo; -1 = N/A
+    double tx_bps;        // byte/s trasmessi nell'intervallo; -1 = N/A
 } NMSample;
+
+// ===================== Traffic helpers =====================
+// Somma ibytes/obytes di tutte le interfacce fisiche non-loopback.
+// Restituisce NO se getifaddrs fallisce.
+static BOOL nm_iface_bytes(uint64_t *rx, uint64_t *tx) {
+    *rx = 0; *tx = 0;
+    struct ifaddrs *ifap = NULL;
+    if (getifaddrs(&ifap) != 0) return NO;
+    for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_LINK) continue;
+        // Escludi loopback e interfacce virtuali comuni
+        const char *n = ifa->ifa_name;
+        if (strncmp(n, "lo",    2) == 0) continue;
+        if (strncmp(n, "utun",  4) == 0) continue;
+        if (strncmp(n, "awdl",  4) == 0) continue;
+        if (strncmp(n, "llw",   3) == 0) continue;
+        if (strncmp(n, "bridge",6) == 0) continue;
+        if (!(ifa->ifa_flags & IFF_UP))  continue;
+        struct if_data *ifd = (struct if_data *)ifa->ifa_data;
+        if (!ifd) continue;
+        *rx += ifd->ifi_ibytes;
+        *tx += ifd->ifi_obytes;
+    }
+    freeifaddrs(ifap);
+    return YES;
+}
 
 // Thread-safe snapshot of hourly stats (computed on BG thread, passed to main thread)
 typedef struct {
@@ -363,6 +395,12 @@ static NSArray *nm_sort(NSMutableArray *arr) {
         BOOL prevUp = YES, firstSample = YES, downActive = NO;
         NSDate *downStart = nil;
 
+        // Baseline traffico (contatori cumulativi al primo tick)
+        uint64_t prevRxBytes = 0, prevTxBytes = 0;
+        NSTimeInterval prevTrafficTime = 0;
+        BOOL hasTrafficBaseline = nm_iface_bytes(&prevRxBytes, &prevTxBytes);
+        if (hasTrafficBaseline) prevTrafficTime = [NSDate timeIntervalSinceReferenceDate];
+
         while (_running) {
             @autoreleasepool {
                 NSDate *tick = [NSDate date];
@@ -428,6 +466,25 @@ static NSArray *nm_sort(NSMutableArray *arr) {
                 s.http_median = nm_median(nm_sort(htMs));
 
                 s.internet_up = s.gateway_ok && (s.icmp_ok > 0 || s.http_ok > 0);
+
+                // ---- Traffico interfacce ----
+                s.rx_bps = s.tx_bps = -1;
+                uint64_t curRx = 0, curTx = 0;
+                NSTimeInterval curTime = [NSDate timeIntervalSinceReferenceDate];
+                if (nm_iface_bytes(&curRx, &curTx) && hasTrafficBaseline && prevTrafficTime > 0) {
+                    double dt = curTime - prevTrafficTime;
+                    if (dt > 0.1) {
+                        // Gestione rollover (contatori uint64: estremamente improbabile,
+                        // ma gestiamo il caso in cui la baseline sia stata resettata)
+                        int64_t dRx = (int64_t)(curRx - prevRxBytes);
+                        int64_t dTx = (int64_t)(curTx - prevTxBytes);
+                        if (dRx >= 0) s.rx_bps = (double)dRx / dt;
+                        if (dTx >= 0) s.tx_bps = (double)dTx / dt;
+                    }
+                }
+                prevRxBytes = curRx; prevTxBytes = curTx;
+                prevTrafficTime = curTime;
+                hasTrafficBaseline = YES;
 
                 // Notes
                 NSMutableArray *notes = [NSMutableArray array];
@@ -506,11 +563,18 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 @end
 
 // ===================== NMStatsView =====================
+#define NM_TRAFFIC_HIST 60   // campioni di storia traffico
+
 @interface NMStatsView : NSView {
     NMStatsSnap _snap;
     NMSample    _sample;
     BOOL        _hasSample;
     BOOL        _isUp;
+    // Ring buffer traffico
+    double _rxHist[NM_TRAFFIC_HIST];
+    double _txHist[NM_TRAFFIC_HIST];
+    int    _histHead;    // indice prossima scrittura (circolare)
+    int    _histCount;   // quanti campioni validi (0..NM_TRAFFIC_HIST)
 }
 - (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up;
 @end
@@ -526,6 +590,11 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 }
 - (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up {
     _snap = snap; _sample = s; _hasSample = YES; _isUp = up;
+    // Aggiorna ring buffer traffico (valori negativi = N/A → 0 nel grafico)
+    _rxHist[_histHead] = s.rx_bps >= 0 ? s.rx_bps : 0;
+    _txHist[_histHead] = s.tx_bps >= 0 ? s.tx_bps : 0;
+    _histHead = (_histHead + 1) % NM_TRAFFIC_HIST;
+    if (_histCount < NM_TRAFFIC_HIST) _histCount++;
     [self setNeedsDisplay:YES];
 }
 - (void)drawRect:(NSRect)__unused dirty {
@@ -673,6 +742,154 @@ static NSArray *nm_sort(NSMutableArray *arr) {
         [NSString stringWithFormat:@"%d/%d  %@",
          _sample.http_ok, _sample.http_total, ms(_sample.http_median)],
         _sample.http_ok == _sample.http_total ? colGreen : colOrange);
+
+    // ---- TRAFFICO ----
+    if (_histCount > 0) {
+
+    section(@"TRAFFICO");
+
+    // Formattatore throughput leggibile
+    NSString *(^fmtBps)(double) = ^(double bps) {
+        if (bps < 0)          return @"—";
+        if (bps < 1024)       return [NSString stringWithFormat:@"%.0f B/s",     bps];
+        if (bps < 1024*1024)  return [NSString stringWithFormat:@"%.1f KB/s",    bps / 1024.0];
+        return                       [NSString stringWithFormat:@"%.2f MB/s",    bps / (1024.0*1024.0)];
+    };
+
+    {
+        // Contatori RX / TX ultimi valori
+        int lastIdx = (_histHead - 1 + NM_TRAFFIC_HIST) % NM_TRAFFIC_HIST;
+        double lastRx = _rxHist[lastIdx];
+        double lastTx = _txHist[lastIdx];
+
+        NSDictionary *rxA = @{
+            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium],
+            NSForegroundColorAttributeName: [NSColor colorWithRed:0.30 green:0.78 blue:1.00 alpha:1] };
+        NSDictionary *txA = @{
+            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium],
+            NSForegroundColorAttributeName: [NSColor colorWithRed:1.00 green:0.65 blue:0.15 alpha:1] };
+        NSDictionary *iconA = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:11],
+            NSForegroundColorAttributeName: colMid };
+
+        NSString *rxS  = fmtBps(lastRx);
+        NSString *txS  = fmtBps(lastTx);
+        NSSize   rxSz  = [rxS sizeWithAttributes:rxA];
+        NSSize   txSz  = [txS sizeWithAttributes:txA];
+
+        float half = pw / 2.0f;
+        [@"↓ RX" drawAtPoint:NSMakePoint(x,            y) withAttributes:iconA];
+        [rxS     drawAtPoint:NSMakePoint(x + half - rxSz.width - 4, y) withAttributes:rxA];
+        [@"↑ TX" drawAtPoint:NSMakePoint(x + half + 4, y) withAttributes:iconA];
+        [txS     drawAtPoint:NSMakePoint(x + pw - txSz.width, y) withAttributes:txA];
+        y -= 20;
+
+        // ---- Grafico ----
+        float graphH = MAX(60.0f, MIN(y - 14.0f, 100.0f));  // altezza adattiva
+        float graphY = y - graphH;
+        float graphW = pw;
+
+        // Sfondo grafico
+        [[NSColor colorWithRed:0.04 green:0.06 blue:0.10 alpha:1] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x, graphY, graphW, graphH)
+                                         xRadius:4 yRadius:4] fill];
+
+        // Griglia orizzontale (3 linee)
+        [[NSColor colorWithWhite:0.14 alpha:1] setStroke];
+        for (int gi = 1; gi <= 3; gi++) {
+            float gy = graphY + graphH * gi / 4.0f;
+            NSBezierPath *gl = [NSBezierPath bezierPath];
+            [gl moveToPoint:NSMakePoint(x + 2, gy)];
+            [gl lineToPoint:NSMakePoint(x + graphW - 2, gy)];
+            gl.lineWidth = 0.5;
+            [gl stroke];
+        }
+
+        if (_histCount >= 2) {
+            // Scala Y: massimo tra RX e TX nella storia
+            double ymax = 1024.0;  // minimo 1 KB/s per evitare divisione per zero
+            int start = (_histHead - _histCount + NM_TRAFFIC_HIST) % NM_TRAFFIC_HIST;
+            for (int i = 0; i < _histCount; i++) {
+                int idx = (start + i) % NM_TRAFFIC_HIST;
+                if (_rxHist[idx] > ymax) ymax = _rxHist[idx];
+                if (_txHist[idx] > ymax) ymax = _txHist[idx];
+            }
+            ymax *= 1.15;  // 15% headroom
+
+            float stepX = graphW / (float)(NM_TRAFFIC_HIST - 1);
+
+            // Helper: costruisce il path di un canale e lo riempie
+            void (^drawChannel)(double *, NSColor *, NSColor *) =
+                ^(double *hist, NSColor *lineCol, NSColor *fillCol) {
+                NSBezierPath *path = [NSBezierPath bezierPath];
+                BOOL first = YES;
+                for (int i = 0; i < _histCount; i++) {
+                    int  idx = (start + i) % NM_TRAFFIC_HIST;
+                    // Allinea a destra: i campioni più vecchi a sinistra
+                    float px = x + (NM_TRAFFIC_HIST - _histCount + i) * stepX;
+                    float py = graphY + (float)(hist[idx] / ymax) * (graphH - 2) + 1;
+                    if (first) { [path moveToPoint:NSMakePoint(px, py)]; first = NO; }
+                    else        [path lineToPoint:NSMakePoint(px, py)];
+                }
+                // Chiudi area verso il basso
+                NSBezierPath *fill = [path copy];
+                int lastI = _histCount - 1;
+                int lastIdx2 = (start + lastI) % NM_TRAFFIC_HIST;
+                float lastPx = x + (NM_TRAFFIC_HIST - _histCount + lastI) * stepX;
+                float firstPx = x + (NM_TRAFFIC_HIST - _histCount) * stepX;
+                [fill lineToPoint:NSMakePoint(lastPx, graphY + 1)];
+                [fill lineToPoint:NSMakePoint(firstPx, graphY + 1)];
+                [fill closePath];
+                (void)lastIdx2;
+                [fillCol setFill];
+                [fill fill];
+                [lineCol setStroke];
+                path.lineWidth = 1.5;
+                [path stroke];
+            };
+
+            // TX (arancio) prima → sotto RX
+            drawChannel(_txHist,
+                [NSColor colorWithRed:1.00 green:0.65 blue:0.15 alpha:0.9],
+                [NSColor colorWithRed:0.60 green:0.35 blue:0.05 alpha:0.30]);
+            // RX (ciano) sopra
+            drawChannel(_rxHist,
+                [NSColor colorWithRed:0.30 green:0.78 blue:1.00 alpha:0.9],
+                [NSColor colorWithRed:0.05 green:0.35 blue:0.60 alpha:0.30]);
+
+            // Etichetta scala (valore massimo)
+            NSString *(^fmtScale)(double) = ^(double v) {
+                if (v < 1024)        return [NSString stringWithFormat:@"%.0f B/s",  v];
+                if (v < 1024*1024)   return [NSString stringWithFormat:@"%.0f KB/s", v / 1024.0];
+                return                      [NSString stringWithFormat:@"%.1f MB/s", v / (1024.0*1024.0)];
+            };
+            NSDictionary *scaleA = @{
+                NSFontAttributeName: [NSFont monospacedSystemFontOfSize:8 weight:NSFontWeightLight],
+                NSForegroundColorAttributeName: colDim };
+            NSString *scaleS = fmtScale(ymax / 1.15);
+            [scaleS drawAtPoint:NSMakePoint(x + 3, graphY + graphH - 10) withAttributes:scaleA];
+        }
+
+        // Legenda RX / TX
+        NSDictionary *legA = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:8],
+            NSForegroundColorAttributeName: colDim };
+        NSString *leg = @"— RX  — TX";
+        (void)leg;
+        NSString *legRX = @"▬ RX";
+        NSString *legTX = @"▬ TX";
+        NSDictionary *legRXA = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:8],
+            NSForegroundColorAttributeName: [NSColor colorWithRed:0.30 green:0.78 blue:1.00 alpha:0.8] };
+        NSDictionary *legTXA = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:8],
+            NSForegroundColorAttributeName: [NSColor colorWithRed:1.00 green:0.65 blue:0.15 alpha:0.8] };
+        (void)legA;
+        [legRX drawAtPoint:NSMakePoint(x + 3, graphY - 12) withAttributes:legRXA];
+        [legTX drawAtPoint:NSMakePoint(x + 38, graphY - 12) withAttributes:legTXA];
+    }
+
+    } // end if (_histCount > 0)
 }
 @end
 
