@@ -516,6 +516,14 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 @end
 
 @implementation NMStatsView
+- (instancetype)initWithFrame:(NSRect)fr {
+    self = [super initWithFrame:fr];
+    if (self) {
+        self.wantsLayer = YES;
+        self.layer.backgroundColor = [[NSColor colorWithRed:0.07 green:0.09 blue:0.15 alpha:1] CGColor];
+    }
+    return self;
+}
 - (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up {
     _snap = snap; _sample = s; _hasSample = YES; _isUp = up;
     [self setNeedsDisplay:YES];
@@ -696,6 +704,12 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     [NSApp activateIgnoringOtherApps:YES];
     [self buildMenu];
     [self buildWindow];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        float cw = self->_win.contentView.frame.size.width;
+        float ch = self->_win.contentView.frame.size.height - HEADER_H;
+        [self->_mainSplit setPosition:cw * 0.68 ofDividerAtIndex:0];
+        [self->_topSplit  setPosition:ch * 0.65 ofDividerAtIndex:0];
+    });
 }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)a { return YES; }
 
@@ -738,6 +752,9 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     t.textColor = [NSColor colorWithWhite:0.82 alpha:1];
     t.font = [NSFont monospacedSystemFontOfSize:LOG_FONT_SZ weight:NSFontWeightRegular];
     t.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [t.textContainer setWidthTracksTextView:NO];
+    [t.textContainer setContainerSize:NSMakeSize(FLT_MAX, FLT_MAX)];
+    sv.hasHorizontalScroller = YES;
     sv.documentView = t;
     if (tv) *tv = t;
     return sv;
@@ -845,9 +862,6 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     _statsView = [[NMStatsView alloc] initWithFrame:NSMakeRect(0, 0, WIN_W * 0.32, contentH)];
     _statsView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [_mainSplit addSubview:_statsView];
-
-    [_mainSplit setPosition:WIN_W * 0.68    ofDividerAtIndex:0];
-    [_topSplit  setPosition:contentH * 0.65 ofDividerAtIndex:0];
 
     [_win makeKeyAndOrderFront:nil];
     [_win makeFirstResponder:_startBtn];
