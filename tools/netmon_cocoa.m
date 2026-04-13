@@ -87,6 +87,32 @@ typedef struct {
     double httpMedian, httpP95;
 } NMStatsSnap;
 
+// ===================== Gateway detection =====================
+// Rileva il default gateway via `route -n get default`.
+// Restituisce l'IP come stringa, o DFLT_GATEWAY come fallback.
+static NSString *nm_detect_gateway(void) {
+    FILE *f = popen("/sbin/route -n get default 2>/dev/null", "r");
+    if (!f) return DFLT_GATEWAY;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        // La riga ha forma "    gateway: 192.168.x.x"
+        char *p = strstr(line, "gateway:");
+        if (!p) continue;
+        p += strlen("gateway:");
+        while (*p == ' ' || *p == '\t') p++;
+        // Tronca al newline
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        if (strlen(p) > 0) {
+            NSString *gw = [NSString stringWithUTF8String:p];
+            pclose(f);
+            return gw;
+        }
+    }
+    pclose(f);
+    return DFLT_GATEWAY;
+}
+
 // ===================== Array stats helpers =====================
 static double nm_median(NSArray *sorted) {
     if (!sorted.count) return -1;
@@ -1005,7 +1031,7 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     NSTextField *l1 = [self makeLbl:@"Gateway:" size:11 bold:NO];
     l1.frame = NSMakeRect(hx, hy + 3, 56, 18); [hdr addSubview:l1]; hx += 60;
     _gwField = [self makeInput:@"192.168.1.1"];
-    _gwField.stringValue = DFLT_GATEWAY;
+    _gwField.stringValue = nm_detect_gateway();
     _gwField.frame = NSMakeRect(hx, hy, 108, 24); [hdr addSubview:_gwField]; hx += 116;
 
     NSTextField *l2 = [self makeLbl:@"Intervallo (s):" size:11 bold:NO];
