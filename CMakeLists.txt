@@ -18,4 +18,5 @@ set_target_properties(netmon_client PROPERTIES
 target_compile_options(netmon_client PRIVATE -Wall -Wno-deprecated-declarations)
 target_link_libraries(netmon_client PRIVATE
     "-framework AppKit"
-    "-framework Foundation")
+    "-framework Foundation"
+    "-framework IOKit")

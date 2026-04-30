@@ -14,6 +14,10 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_dl.h>
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 
 // ===================== Globals (set in main) =====================
 static NSString *kOutputDir;
@@ -26,10 +30,17 @@ static NSArray  *kHTTPTestURLs;
 #define PING_TIMEOUT_MS    1000
 #define LOG_FONT_SZ        11.0
 #define WIN_W              1150.0
-#define WIN_H               720.0
+#define WIN_H               820.0
 #define HEADER_H             52.0
 
 // ===================== Data Structures =====================
+typedef struct {
+    int   pct;          // 0..100; -1 = N/A (desktop senza batteria)
+    BOOL  charging;     // in carica
+    BOOL  onAC;         // alimentatore esterno collegato
+    int   minutesLeft;  // minuti rimanenti (solo scarica); -1 = N/A
+} NMBattery;
+
 typedef struct {
     double ts_unix;
     BOOL   gateway_ok;
@@ -44,6 +55,11 @@ typedef struct {
     char   notes[512];
     double rx_bps;        // byte/s ricevuti nell'intervallo; -1 = N/A
     double tx_bps;        // byte/s trasmessi nell'intervallo; -1 = N/A
+    double cpu_pct;       // 0..100; -1 = N/A
+    double ram_pct;       // 0..100; -1 = N/A
+    double ram_used_mb;
+    double icmp_jitter;   // |delta mediana ICMP| rispetto al campione prec. (ms); -1 = N/A
+    NMBattery battery;
 } NMSample;
 
 // ===================== Traffic helpers =====================
@@ -85,6 +101,9 @@ typedef struct {
     double icmpMedian, icmpP95;
     double dnsMedian;
     double httpMedian, httpP95;
+    double cpuMedian;
+    double ramMedian;
+    double icmpJitter;   // mediana dei jitter nell'ora
 } NMStatsSnap;
 
 // ===================== Gateway detection =====================
@@ -132,6 +151,92 @@ static double nm_percentile(NSArray *sorted, double p) {
 static NSArray *nm_sort(NSMutableArray *arr) {
     return [arr sortedArrayUsingSelector:@selector(compare:)];
 }
+__attribute__((unused)) static double nm_stddev(NSArray *arr) {
+    if (arr.count < 2) return -1;
+    double sum = 0;
+    for (NSNumber *n in arr) sum += n.doubleValue;
+    double mean = sum / arr.count;
+    double sq = 0;
+    for (NSNumber *n in arr) { double d = n.doubleValue - mean; sq += d * d; }
+    return sqrt(sq / arr.count);
+}
+
+// ===================== System probes =====================
+static double nm_cpu_usage(uint64_t *prevIdle, uint64_t *prevTotal) {
+    host_cpu_load_info_data_t info;
+    mach_msg_type_number_t cnt = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
+                        (host_info_t)&info, &cnt) != KERN_SUCCESS) return -1;
+    uint64_t total = 0;
+    for (int i = 0; i < CPU_STATE_MAX; i++) total += info.cpu_ticks[i];
+    uint64_t idle = info.cpu_ticks[CPU_STATE_IDLE];
+    double pct = -1;
+    if (*prevTotal > 0 && total > *prevTotal) {
+        uint64_t dt = total - *prevTotal;
+        uint64_t di = idle  - *prevIdle;
+        pct = 100.0 * (1.0 - (double)di / (double)dt);
+        if (pct < 0)   pct = 0;
+        if (pct > 100) pct = 100;
+    }
+    *prevIdle  = idle;
+    *prevTotal = total;
+    return pct;
+}
+
+static double nm_ram_info(double *usedMB, double *totalMB) {
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &cnt) != KERN_SUCCESS) {
+        if (usedMB)  *usedMB  = -1;
+        if (totalMB) *totalMB = -1;
+        return -1;
+    }
+    uint64_t page = vm_page_size;
+    uint64_t used = ((uint64_t)vm.active_count + vm.wire_count) * page;
+    int64_t physMem = 0;
+    size_t len = sizeof(physMem);
+    sysctlbyname("hw.memsize", &physMem, &len, NULL, 0);
+    if (usedMB)  *usedMB  = (double)used / (1024.0 * 1024.0);
+    if (totalMB) *totalMB = physMem > 0 ? (double)physMem / (1024.0 * 1024.0) : -1;
+    return (physMem > 0) ? 100.0 * (double)used / (double)physMem : -1;
+}
+
+static NMBattery nm_battery(void) {
+    NMBattery b = {-1, NO, YES, -1};
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (!info) return b;
+    CFArrayRef list = IOPSCopyPowerSourcesList(info);
+    if (!list) { CFRelease(info); return b; }
+    if (CFArrayGetCount(list) == 0) {   // Desktop senza batteria
+        CFRelease(list); CFRelease(info);
+        return b;
+    }
+    CFTypeRef src = CFArrayGetValueAtIndex(list, 0);
+    CFDictionaryRef d = IOPSGetPowerSourceDescription(info, src);  // Get rule: no release
+    if (d) {
+        // kIOPS* sono #define string literal in IOPSKeys.h → CFSTR() funziona
+        CFNumberRef curCap = CFDictionaryGetValue(d, CFSTR(kIOPSCurrentCapacityKey));
+        CFNumberRef maxCap = CFDictionaryGetValue(d, CFSTR(kIOPSMaxCapacityKey));
+        if (curCap && maxCap) {
+            int cur = 0, max = 0;
+            CFNumberGetValue(curCap, kCFNumberIntType, &cur);
+            CFNumberGetValue(maxCap, kCFNumberIntType, &max);
+            if (max > 0) b.pct = (int)(100.0 * cur / max + 0.5);
+        }
+        CFStringRef state = CFDictionaryGetValue(d, CFSTR(kIOPSPowerSourceStateKey));
+        b.onAC = (state && CFStringCompare(state, CFSTR(kIOPSACPowerValue), 0) == kCFCompareEqualTo);
+        CFBooleanRef chg = CFDictionaryGetValue(d, CFSTR(kIOPSIsChargingKey));
+        b.charging = (chg && CFBooleanGetValue(chg));
+        if (!b.onAC) {
+            CFNumberRef tte = CFDictionaryGetValue(d, CFSTR(kIOPSTimeToEmptyKey));
+            if (tte) { int m = 0; CFNumberGetValue(tte, kCFNumberIntType, &m); b.minutesLeft = m; }
+        }
+    }
+    CFRelease(list);
+    CFRelease(info);
+    return b;
+}
 
 // ===================== NMHourStats =====================
 @interface NMHourStats : NSObject
@@ -143,6 +248,7 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 @property (atomic) int     reconnectEvents;
 @property (atomic) double  downtimeSec;
 @property NSMutableArray  *gwRTTs, *icmpRTTs, *dnsTimes, *httpTimes;
+@property NSMutableArray  *cpuPcts, *ramPcts, *icmpJitters;
 - (instancetype)initWithDate:(NSDate *)d;
 - (void)addSample:(NMSample *)s intervalSec:(int)iv;
 - (NMStatsSnap)snapshot;
@@ -153,10 +259,13 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 - (instancetype)initWithDate:(NSDate *)d {
     self = [super init];
     _hourStart = d;
-    _gwRTTs   = [NSMutableArray array];
-    _icmpRTTs = [NSMutableArray array];
-    _dnsTimes = [NSMutableArray array];
-    _httpTimes= [NSMutableArray array];
+    _gwRTTs      = [NSMutableArray array];
+    _icmpRTTs    = [NSMutableArray array];
+    _dnsTimes    = [NSMutableArray array];
+    _httpTimes   = [NSMutableArray array];
+    _cpuPcts     = [NSMutableArray array];
+    _ramPcts     = [NSMutableArray array];
+    _icmpJitters = [NSMutableArray array];
     return self;
 }
 - (void)addSample:(NMSample *)s intervalSec:(int)iv {
@@ -164,22 +273,29 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     if (!s->gateway_ok) self.gatewayFail++;
     else if (s->gateway_rtt >= 0) [self.gwRTTs  addObject:@(s->gateway_rtt)];
     if (!s->internet_up) { self.internetDown++; self.downtimeSec += iv; }
-    if (s->icmp_median >= 0) [self.icmpRTTs addObject:@(s->icmp_median)];
+    if (s->icmp_median  >= 0) [self.icmpRTTs    addObject:@(s->icmp_median)];
     if (s->dns_ok && s->dns_ms >= 0) [self.dnsTimes addObject:@(s->dns_ms)];
-    if (s->http_median >= 0) [self.httpTimes addObject:@(s->http_median)];
+    if (s->http_median  >= 0) [self.httpTimes   addObject:@(s->http_median)];
+    if (s->cpu_pct      >= 0) [self.cpuPcts     addObject:@(s->cpu_pct)];
+    if (s->ram_pct      >= 0) [self.ramPcts     addObject:@(s->ram_pct)];
+    if (s->icmp_jitter  >= 0) [self.icmpJitters addObject:@(s->icmp_jitter)];
 }
 - (NMStatsSnap)snapshot {
     NSArray *gw  = nm_sort(self.gwRTTs);
     NSArray *ic  = nm_sort(self.icmpRTTs);
     NSArray *dn  = nm_sort(self.dnsTimes);
     NSArray *ht  = nm_sort(self.httpTimes);
+    NSArray *cp  = nm_sort(self.cpuPcts);
+    NSArray *rm  = nm_sort(self.ramPcts);
+    NSArray *jt  = nm_sort(self.icmpJitters);
     double avail = self.samples > 0
         ? 100.0 * (self.samples - self.internetDown) / self.samples : 100.0;
     NMStatsSnap s = {
         avail, self.downtimeSec,
         self.samples, self.disconnectEvents, self.reconnectEvents, self.gatewayFail,
         nm_median(gw), nm_median(ic), nm_percentile(ic, 0.95),
-        nm_median(dn), nm_median(ht), nm_percentile(ht, 0.95)
+        nm_median(dn), nm_median(ht), nm_percentile(ht, 0.95),
+        nm_median(cp), nm_median(rm), nm_median(jt)
     };
     return s;
 }
@@ -205,12 +321,18 @@ static NSArray *nm_sort(NSMutableArray *arr) {
         @"Tempo DNS mediano     : %@ ms\n"
         @"Tempo HTTP mediano    : %@ ms\n"
         @"Tempo HTTP p95        : %@ ms\n"
+        @"Jitter ICMP mediano   : %@ ms\n\n"
+        @"CPU mediana           : %@%%\n"
+        @"RAM mediana           : %@%%\n"
         @"======================================================================\n\n",
         [df stringFromDate:self.hourStart],
         s.samples, s.availability, s.downtimeSec,
         s.disconnectEvents, s.reconnectEvents, s.gatewayFail,
         ms(s.gwMedian), ms(s.icmpMedian), ms(s.icmpP95),
-        ms(s.dnsMedian), ms(s.httpMedian), ms(s.httpP95)];
+        ms(s.dnsMedian), ms(s.httpMedian), ms(s.httpP95),
+        ms(s.icmpJitter),
+        s.cpuMedian < 0 ? @"-" : [NSString stringWithFormat:@"%.1f", s.cpuMedian],
+        s.ramMedian < 0 ? @"-" : [NSString stringWithFormat:@"%.1f", s.ramMedian]];
 }
 @end
 
@@ -339,7 +461,8 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     if (_csvF && ftell(_csvF) == 0)
         fprintf(_csvF,
             "timestamp,gateway_ok,gateway_rtt_ms,icmp_ok,icmp_total,icmp_median_ms,"
-            "dns_ok,dns_ms,http_ok,http_total,http_median_ms,internet_up,notes\n");
+            "dns_ok,dns_ms,http_ok,http_total,http_median_ms,internet_up,"
+            "cpu_pct,ram_pct,icmp_jitter_ms,bat_pct,notes\n");
     return self;
 }
 - (void)writeCSV:(NMSample *)s {
@@ -347,13 +470,15 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     NSDate *d = [NSDate dateWithTimeIntervalSince1970:s->ts_unix];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss";
-    fprintf(_csvF, "%s,%d,%.1f,%d,%d,%.1f,%d,%.1f,%d,%d,%.1f,%d,\"%s\"\n",
+    fprintf(_csvF, "%s,%d,%.1f,%d,%d,%.1f,%d,%.1f,%d,%d,%.1f,%d,%.1f,%.1f,%.1f,%d,\"%s\"\n",
         [df stringFromDate:d].UTF8String,
         s->gateway_ok, s->gateway_rtt,
         s->icmp_ok, s->icmp_total, s->icmp_median,
         s->dns_ok, s->dns_ms,
         s->http_ok, s->http_total, s->http_median,
-        s->internet_up, s->notes);
+        s->internet_up,
+        s->cpu_pct, s->ram_pct, s->icmp_jitter, s->battery.pct,
+        s->notes);
     fflush(_csvF);
 }
 - (void)writeEvent:(NSString *)txt {
@@ -427,6 +552,11 @@ static NSArray *nm_sort(NSMutableArray *arr) {
         BOOL hasTrafficBaseline = nm_iface_bytes(&prevRxBytes, &prevTxBytes);
         if (hasTrafficBaseline) prevTrafficTime = [NSDate timeIntervalSinceReferenceDate];
 
+        // Baseline CPU e jitter ICMP
+        uint64_t prevCpuIdle = 0, prevCpuTotal = 0;
+        double prevIcmpMedian = -1;
+        nm_cpu_usage(&prevCpuIdle, &prevCpuTotal);  // primo campione: stabilisce baseline
+
         while (_running) {
             @autoreleasepool {
                 NSDate *tick = [NSDate date];
@@ -475,6 +605,11 @@ static NSArray *nm_sort(NSMutableArray *arr) {
                 }
                 s.icmp_median = nm_median(nm_sort(icRTTs));
 
+                // Jitter ICMP (variazione tra mediane consecutive)
+                s.icmp_jitter = (prevIcmpMedian >= 0 && s.icmp_median >= 0)
+                    ? fabs(s.icmp_median - prevIcmpMedian) : -1;
+                if (s.icmp_median >= 0) prevIcmpMedian = s.icmp_median;
+
                 // DNS
                 double dms;
                 s.dns_ok = [NMProbe dnsLookup:kDNSTestHost ms:&dms];
@@ -511,6 +646,11 @@ static NSArray *nm_sort(NSMutableArray *arr) {
                 prevRxBytes = curRx; prevTxBytes = curTx;
                 prevTrafficTime = curTime;
                 hasTrafficBaseline = YES;
+
+                // ---- CPU, RAM, Batteria ----
+                s.cpu_pct = nm_cpu_usage(&prevCpuIdle, &prevCpuTotal);
+                s.ram_pct = nm_ram_info(&s.ram_used_mb, NULL);
+                s.battery = nm_battery();
 
                 // Notes
                 NSMutableArray *notes = [NSMutableArray array];
@@ -599,8 +739,12 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     // Ring buffer traffico
     double _rxHist[NM_TRAFFIC_HIST];
     double _txHist[NM_TRAFFIC_HIST];
+    // Ring buffer sistema (CPU / RAM %)
+    double _cpuHist[NM_TRAFFIC_HIST];
+    double _ramHist[NM_TRAFFIC_HIST];
     int    _histHead;    // indice prossima scrittura (circolare)
     int    _histCount;   // quanti campioni validi (0..NM_TRAFFIC_HIST)
+    NMBattery _battery;
 }
 - (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up;
 @end
@@ -617,8 +761,11 @@ static NSArray *nm_sort(NSMutableArray *arr) {
 - (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up {
     _snap = snap; _sample = s; _hasSample = YES; _isUp = up;
     // Aggiorna ring buffer traffico (valori negativi = N/A → 0 nel grafico)
-    _rxHist[_histHead] = s.rx_bps >= 0 ? s.rx_bps : 0;
-    _txHist[_histHead] = s.tx_bps >= 0 ? s.tx_bps : 0;
+    _rxHist[_histHead]  = s.rx_bps  >= 0 ? s.rx_bps  : 0;
+    _txHist[_histHead]  = s.tx_bps  >= 0 ? s.tx_bps  : 0;
+    _cpuHist[_histHead] = s.cpu_pct >= 0 ? s.cpu_pct : 0;
+    _ramHist[_histHead] = s.ram_pct >= 0 ? s.ram_pct : 0;
+    _battery = s.battery;
     _histHead = (_histHead + 1) % NM_TRAFFIC_HIST;
     if (_histCount < NM_TRAFFIC_HIST) _histCount++;
     [self setNeedsDisplay:YES];
@@ -742,12 +889,16 @@ static NSArray *nm_sort(NSMutableArray *arr) {
     NSColor *(^latCol)(double) = ^(double v) {
         return (v < 0 || v < 50) ? colGreen : (v < 150) ? colOrange : colRed;
     };
-    row(@"GW mediana",   ms(_snap.gwMedian),   latCol(_snap.gwMedian));
-    row(@"ICMP mediana", ms(_snap.icmpMedian), latCol(_snap.icmpMedian));
-    row(@"ICMP p95",     ms(_snap.icmpP95),    latCol(_snap.icmpP95));
-    row(@"DNS mediano",  ms(_snap.dnsMedian),  latCol(_snap.dnsMedian));
-    row(@"HTTP mediano", ms(_snap.httpMedian), latCol(_snap.httpMedian));
-    row(@"HTTP p95",     ms(_snap.httpP95),    latCol(_snap.httpP95));
+    NSColor *(^jitCol)(double) = ^(double v) {
+        return (v < 0 || v < 10) ? colGreen : (v < 30) ? colOrange : colRed;
+    };
+    row(@"GW mediana",   ms(_snap.gwMedian),    latCol(_snap.gwMedian));
+    row(@"ICMP mediana", ms(_snap.icmpMedian),  latCol(_snap.icmpMedian));
+    row(@"ICMP p95",     ms(_snap.icmpP95),     latCol(_snap.icmpP95));
+    row(@"ICMP jitter",  ms(_snap.icmpJitter),  jitCol(_snap.icmpJitter));
+    row(@"DNS mediano",  ms(_snap.dnsMedian),   latCol(_snap.dnsMedian));
+    row(@"HTTP mediano", ms(_snap.httpMedian),  latCol(_snap.httpMedian));
+    row(@"HTTP p95",     ms(_snap.httpP95),     latCol(_snap.httpP95));
 
     // ---- ULTIMO CAMPIONE ----
     section(@"ULTIMO CAMPIONE");
@@ -768,6 +919,72 @@ static NSArray *nm_sort(NSMutableArray *arr) {
         [NSString stringWithFormat:@"%d/%d  %@",
          _sample.http_ok, _sample.http_total, ms(_sample.http_median)],
         _sample.http_ok == _sample.http_total ? colGreen : colOrange);
+
+    // ---- SISTEMA ----
+    section(@"SISTEMA");
+    {
+        float lblW = 38, barH2 = 12, valW = 46;
+        float barW2 = pw - lblW - valW - 10;
+
+        // Blocco miniBar: disegna label + progress bar + valore %
+        void (^miniBar)(NSString *, double) = ^(NSString *lbl, double pct) {
+            [lbl drawAtPoint:NSMakePoint(x, y + 1) withAttributes:labelA];
+            // Sfondo barra
+            [[NSColor colorWithWhite:0.15 alpha:1] setFill];
+            [[NSBezierPath bezierPathWithRoundedRect:
+                NSMakeRect(x + lblW, y, barW2, barH2) xRadius:3 yRadius:3] fill];
+            // Riempimento colorato
+            if (pct >= 0) {
+                double frac = MIN(1.0, MAX(0.0, pct / 100.0));
+                NSColor *bc = (pct < 50)
+                    ? [NSColor colorWithRed:0.10 green:0.55 blue:0.22 alpha:1]
+                    : (pct < 80)
+                    ? [NSColor colorWithRed:0.60 green:0.55 blue:0.05 alpha:1]
+                    : [NSColor colorWithRed:0.65 green:0.20 blue:0.05 alpha:1];
+                if (frac > 0.001) {
+                    [bc setFill];
+                    [[NSBezierPath bezierPathWithRoundedRect:
+                        NSMakeRect(x + lblW, y, barW2 * frac, barH2) xRadius:3 yRadius:3] fill];
+                }
+            }
+            // Valore testuale a destra
+            NSString *valStr = pct < 0
+                ? @"—"
+                : [NSString stringWithFormat:@"%.0f%%", pct];
+            NSColor *vc = pct < 0 ? colDim
+                        : (pct < 50) ? colGreen : (pct < 80) ? colOrange : colRed;
+            NSDictionary *va2 = @{
+                NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium],
+                NSForegroundColorAttributeName: vc };
+            NSSize vs2 = [valStr sizeWithAttributes:va2];
+            [valStr drawAtPoint:NSMakePoint(x + pw - vs2.width, y + 1) withAttributes:va2];
+            y -= 20;
+        };
+
+        miniBar(@"CPU", _sample.cpu_pct);
+        miniBar(@"RAM", _sample.ram_pct);
+
+        // Batteria
+        NSString *batVal;
+        NSColor  *batCol;
+        if (_battery.pct < 0) {
+            // Desktop / nessuna batteria rilevata
+            batVal = @"AC";
+            batCol = colMid;
+        } else {
+            NSString *icon = _battery.charging ? @"⚡ " : @"";
+            NSString *timeStr = (!_battery.onAC && _battery.minutesLeft > 0)
+                ? [NSString stringWithFormat:@"  %dh%02d",
+                   _battery.minutesLeft / 60, _battery.minutesLeft % 60]
+                : @"";
+            batVal = [NSString stringWithFormat:@"%@%d%%%@",
+                      icon, _battery.pct, timeStr];
+            batCol = _battery.onAC       ? colGreen
+                   : (_battery.pct > 20) ? colGreen
+                   : (_battery.pct > 10) ? colOrange : colRed;
+        }
+        row(@"Batteria", batVal, batCol);
+    }
 
     // ---- TRAFFICO ----
     if (_histCount > 0) {
