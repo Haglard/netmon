@@ -18,6 +18,7 @@
 #include <sys/sysctl.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
+#include <libproc.h>
 
 // ===================== Globals (set in main) =====================
 static NSString *kOutputDir;
@@ -42,6 +43,12 @@ typedef struct {
 } NMBattery;
 
 typedef struct {
+    char   name[64];    // nome processo (procname)
+    double cpu_pct;     // % CPU assoluta del processo (-1 = N/A o primo campione)
+    double ram_pct;     // % RAM del processo su RAM totale (-1 = N/A)
+} NMTopProc;
+
+typedef struct {
     double ts_unix;
     BOOL   gateway_ok;
     double gateway_rtt;   // ms; -1 = N/A
@@ -60,6 +67,8 @@ typedef struct {
     double ram_used_mb;
     double icmp_jitter;   // |delta mediana ICMP| rispetto al campione prec. (ms); -1 = N/A
     NMBattery battery;
+    NMTopProc top_cpu;    // processo con maggiore CPU nel campione
+    NMTopProc top_ram;    // processo con maggiore RAM nel campione
 } NMSample;
 
 // ===================== Traffic helpers =====================
@@ -236,6 +245,71 @@ static NMBattery nm_battery(void) {
     CFRelease(list);
     CFRelease(info);
     return b;
+}
+
+// Scansiona tutti i processi e restituisce il top CPU e il top RAM.
+// prevCPU: dizionario pid→cpu_ns del campione precedente (aggiornato in-place).
+// prevTime: timestamp del campione precedente (aggiornato in-place).
+static void nm_top_procs(NMTopProc *outCpu, NMTopProc *outRam,
+                          NSMutableDictionary **prevCPU,
+                          NSTimeInterval *prevTime,
+                          int numCores, double totalRamMB) {
+    *outCpu = (NMTopProc){"\0", -1, -1};
+    *outRam = (NMTopProc){"\0", -1, -1};
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    double dt_ns  = (*prevTime > 0) ? (now - *prevTime) * 1e9 : 0;
+    BOOL canCPU   = (dt_ns > 1e8);    // richiede almeno 100 ms di delta
+    double scale  = (numCores > 0 && dt_ns > 0) ? numCores * dt_ns : dt_ns;
+
+    int count = proc_listallpids(NULL, 0);
+    if (count <= 0) { *prevTime = now; return; }
+    pid_t *pids = malloc(sizeof(pid_t) * (count + 8));
+    if (!pids) { *prevTime = now; return; }
+    count = proc_listallpids(pids, sizeof(pid_t) * count);
+
+    NSMutableDictionary *curCPU = [NSMutableDictionary dictionaryWithCapacity:count];
+    NMTopProc bestCpu = {"\0", -1, -1};
+    NMTopProc bestRam = {"\0", -1, -1};
+
+    for (int i = 0; i < count; i++) {
+        pid_t pid = pids[i];
+        if (pid <= 0) continue;
+
+        struct proc_taskinfo ti;
+        int ret = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, sizeof(ti));
+        if (ret < (int)sizeof(ti)) continue;
+
+        // RAM % rispetto alla RAM totale del sistema
+        if (totalRamMB > 0) {
+            double ramPct = 100.0 * (double)ti.pti_resident_size / (totalRamMB * 1024.0 * 1024.0);
+            if (ramPct > bestRam.ram_pct) {
+                bestRam.ram_pct = ramPct;
+                proc_name(pid, bestRam.name, sizeof(bestRam.name) - 1);
+            }
+        }
+
+        // CPU % (delta tick accumulati)
+        uint64_t cpu_ns = ti.pti_total_user + ti.pti_total_system;
+        curCPU[@(pid)] = @(cpu_ns);
+
+        if (canCPU && scale > 0) {
+            NSNumber *prevNs = (*prevCPU)[@(pid)];
+            if (prevNs && cpu_ns >= prevNs.unsignedLongLongValue) {
+                double pct = 100.0 * (double)(cpu_ns - prevNs.unsignedLongLongValue) / scale;
+                if (pct > bestCpu.cpu_pct) {
+                    bestCpu.cpu_pct = pct;
+                    proc_name(pid, bestCpu.name, sizeof(bestCpu.name) - 1);
+                }
+            }
+        }
+    }
+    free(pids);
+
+    *outCpu  = bestCpu;
+    *outRam  = bestRam;
+    *prevCPU = curCPU;
+    *prevTime = now;
 }
 
 // ===================== NMHourStats =====================
@@ -557,6 +631,17 @@ static NMBattery nm_battery(void) {
         double prevIcmpMedian = -1;
         nm_cpu_usage(&prevCpuIdle, &prevCpuTotal);  // primo campione: stabilisce baseline
 
+        // Stato scansione processi
+        int numCores = 1;
+        { int n = 0; size_t sz = sizeof(n);
+          if (!sysctlbyname("hw.logicalcpu", &n, &sz, NULL, 0) && n > 0) numCores = n; }
+        double totalRamMB = -1;
+        { int64_t pm = 0; size_t sz = sizeof(pm);
+          if (!sysctlbyname("hw.memsize", &pm, &sz, NULL, 0) && pm > 0)
+              totalRamMB = (double)pm / (1024.0 * 1024.0); }
+        NSMutableDictionary *prevProcCPU = [NSMutableDictionary dictionary];
+        NSTimeInterval prevProcTime = 0;
+
         while (_running) {
             @autoreleasepool {
                 NSDate *tick = [NSDate date];
@@ -647,10 +732,13 @@ static NMBattery nm_battery(void) {
                 prevTrafficTime = curTime;
                 hasTrafficBaseline = YES;
 
-                // ---- CPU, RAM, Batteria ----
+                // ---- CPU, RAM, Batteria, Top processes ----
                 s.cpu_pct = nm_cpu_usage(&prevCpuIdle, &prevCpuTotal);
                 s.ram_pct = nm_ram_info(&s.ram_used_mb, NULL);
                 s.battery = nm_battery();
+                nm_top_procs(&s.top_cpu, &s.top_ram,
+                             &prevProcCPU, &prevProcTime,
+                             numCores, totalRamMB);
 
                 // Notes
                 NSMutableArray *notes = [NSMutableArray array];
@@ -744,7 +832,9 @@ static NMBattery nm_battery(void) {
     double _ramHist[NM_TRAFFIC_HIST];
     int    _histHead;    // indice prossima scrittura (circolare)
     int    _histCount;   // quanti campioni validi (0..NM_TRAFFIC_HIST)
-    NMBattery _battery;
+    NMBattery  _battery;
+    NMTopProc  _topCpu;
+    NMTopProc  _topRam;
 }
 - (void)updateSnap:(NMStatsSnap)snap sample:(NMSample)s isUp:(BOOL)up;
 @end
@@ -766,6 +856,8 @@ static NMBattery nm_battery(void) {
     _cpuHist[_histHead] = s.cpu_pct >= 0 ? s.cpu_pct : 0;
     _ramHist[_histHead] = s.ram_pct >= 0 ? s.ram_pct : 0;
     _battery = s.battery;
+    _topCpu  = s.top_cpu;
+    _topRam  = s.top_ram;
     _histHead = (_histHead + 1) % NM_TRAFFIC_HIST;
     if (_histCount < NM_TRAFFIC_HIST) _histCount++;
     [self setNeedsDisplay:YES];
@@ -923,67 +1015,133 @@ static NMBattery nm_battery(void) {
     // ---- SISTEMA ----
     section(@"SISTEMA");
     {
-        float lblW = 38, barH2 = 12, valW = 46;
+        float lblW = 38, barH2 = 14, valW = 50;
         float barW2 = pw - lblW - valW - 10;
 
-        // Blocco miniBar: disegna label + progress bar + valore %
-        void (^miniBar)(NSString *, double) = ^(NSString *lbl, double pct) {
-            [lbl drawAtPoint:NSMakePoint(x, y + 1) withAttributes:labelA];
-            // Sfondo barra
+        NSDictionary *procA = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:9],
+            NSForegroundColorAttributeName: [NSColor colorWithWhite:0.38 alpha:1] };
+
+        // ── Barra bicolore (CPU / RAM): verde per la quota sistema, rosso per il top proc ──
+        // totalPct = % totale (0-100), procPct = contributo top proc (-1 = N/A)
+        void (^sysBar)(NSString *, double, double, const char *) =
+            ^(NSString *lbl, double totalPct, double procPct, const char *procName) {
+
+            [lbl drawAtPoint:NSMakePoint(x, y + 2) withAttributes:labelA];
+
+            // Sfondo
             [[NSColor colorWithWhite:0.15 alpha:1] setFill];
             [[NSBezierPath bezierPathWithRoundedRect:
                 NSMakeRect(x + lblW, y, barW2, barH2) xRadius:3 yRadius:3] fill];
-            // Riempimento colorato
-            if (pct >= 0) {
-                double frac = MIN(1.0, MAX(0.0, pct / 100.0));
-                NSColor *bc = (pct < 50)
+
+            if (totalPct >= 0) {
+                // Quota rossa = min(procPct, totalPct); quota verde = il resto
+                double rp  = (procPct >= 0) ? MIN(procPct, totalPct) : 0;
+                double gp  = MAX(0, totalPct - rp);
+                double gFr = MIN(1.0, gp  / 100.0);
+                double rFr = MIN(1.0, rp  / 100.0);
+
+                // Colore verde base (varia con il carico totale)
+                NSColor *gc = (totalPct < 50)
                     ? [NSColor colorWithRed:0.10 green:0.55 blue:0.22 alpha:1]
-                    : (pct < 80)
+                    : (totalPct < 80)
+                    ? [NSColor colorWithRed:0.60 green:0.55 blue:0.05 alpha:1]
+                    : [NSColor colorWithRed:0.65 green:0.20 blue:0.05 alpha:1];
+
+                if (gFr > 0.001) {
+                    [gc setFill];
+                    [[NSBezierPath bezierPathWithRoundedRect:
+                        NSMakeRect(x + lblW, y, barW2 * gFr, barH2)
+                                  xRadius:3 yRadius:3] fill];
+                }
+                // Segmento rosso (top processo), adiacente alla quota verde
+                if (rFr > 0.001) {
+                    [[NSColor colorWithRed:0.85 green:0.18 blue:0.18 alpha:1] setFill];
+                    float redX = x + lblW + barW2 * gFr;
+                    float redW = barW2 * rFr;
+                    [[NSBezierPath bezierPathWithRoundedRect:
+                        NSMakeRect(redX, y, redW, barH2) xRadius:3 yRadius:3] fill];
+                }
+            }
+
+            // Valore % a destra
+            NSString *valStr = (totalPct < 0) ? @"—"
+                : [NSString stringWithFormat:@"%.0f%%", totalPct];
+            NSColor *vc = (totalPct < 0) ? colDim
+                : (totalPct < 50) ? colGreen : (totalPct < 80) ? colOrange : colRed;
+            NSDictionary *va2 = @{
+                NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium],
+                NSForegroundColorAttributeName: vc };
+            NSSize vs2 = [valStr sizeWithAttributes:va2];
+            [valStr drawAtPoint:NSMakePoint(x + pw - vs2.width, y + 2) withAttributes:va2];
+            y -= (barH2 + 3);
+
+            // Nome processo (sotto la barra, in rosso tenue se procPct significativo)
+            if (procName && procName[0] != '\0' && procPct > 0.5) {
+                NSString *nameStr = [NSString stringWithFormat:@"  %s  %.0f%%",
+                                     procName, procPct];
+                [nameStr drawAtPoint:NSMakePoint(x + lblW, y) withAttributes:procA];
+            }
+            y -= 13;
+        };
+
+        // ── Barra batteria (colore teal, distinto da CPU/RAM) ──
+        void (^batBar)(void) = ^{
+            [@"Batteria" drawAtPoint:NSMakePoint(x, y + 2) withAttributes:labelA];
+
+            // Sfondo
+            [[NSColor colorWithWhite:0.15 alpha:1] setFill];
+            [[NSBezierPath bezierPathWithRoundedRect:
+                NSMakeRect(x + lblW, y, barW2, barH2) xRadius:3 yRadius:3] fill];
+
+            if (_battery.pct >= 0) {
+                double frac = MIN(1.0, _battery.pct / 100.0);
+                // teal per alta carica, ambra per media, rosso per bassa
+                NSColor *bc = (_battery.pct > 50)
+                    ? [NSColor colorWithRed:0.10 green:0.62 blue:0.75 alpha:1]
+                    : (_battery.pct > 20)
                     ? [NSColor colorWithRed:0.60 green:0.55 blue:0.05 alpha:1]
                     : [NSColor colorWithRed:0.65 green:0.20 blue:0.05 alpha:1];
                 if (frac > 0.001) {
                     [bc setFill];
                     [[NSBezierPath bezierPathWithRoundedRect:
-                        NSMakeRect(x + lblW, y, barW2 * frac, barH2) xRadius:3 yRadius:3] fill];
+                        NSMakeRect(x + lblW, y, barW2 * frac, barH2)
+                                  xRadius:3 yRadius:3] fill];
                 }
             }
-            // Valore testuale a destra
-            NSString *valStr = pct < 0
-                ? @"—"
-                : [NSString stringWithFormat:@"%.0f%%", pct];
-            NSColor *vc = pct < 0 ? colDim
-                        : (pct < 50) ? colGreen : (pct < 80) ? colOrange : colRed;
-            NSDictionary *va2 = @{
+
+            // Etichetta valore a destra
+            NSString *batStr;
+            NSColor  *batLblCol;
+            if (_battery.pct < 0) {
+                batStr    = @"AC";
+                batLblCol = colMid;
+            } else {
+                NSString *icon = _battery.charging ? @"⚡ " : @"";
+                NSString *tte  = (!_battery.onAC && _battery.minutesLeft > 0)
+                    ? [NSString stringWithFormat:@" %dh%02d",
+                       _battery.minutesLeft / 60, _battery.minutesLeft % 60]
+                    : @"";
+                batStr    = [NSString stringWithFormat:@"%@%d%%%@", icon, _battery.pct, tte];
+                batLblCol = (_battery.pct > 50)
+                    ? [NSColor colorWithRed:0.15 green:0.75 blue:0.88 alpha:1]
+                    : (_battery.pct > 20) ? colOrange : colRed;
+            }
+            NSDictionary *bva = @{
                 NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium],
-                NSForegroundColorAttributeName: vc };
-            NSSize vs2 = [valStr sizeWithAttributes:va2];
-            [valStr drawAtPoint:NSMakePoint(x + pw - vs2.width, y + 1) withAttributes:va2];
-            y -= 20;
+                NSForegroundColorAttributeName: batLblCol };
+            NSSize bsz = [batStr sizeWithAttributes:bva];
+            [batStr drawAtPoint:NSMakePoint(x + pw - bsz.width, y + 2) withAttributes:bva];
+            y -= (barH2 + 3);
         };
 
-        miniBar(@"CPU", _sample.cpu_pct);
-        miniBar(@"RAM", _sample.ram_pct);
+        // Recupera info top proc dagli ivar aggiornati dall'ultimo campione
+        double cpuProcPct = _topCpu.cpu_pct;   // -1 se N/A
+        double ramProcPct = _topRam.ram_pct;   // -1 se N/A
 
-        // Batteria
-        NSString *batVal;
-        NSColor  *batCol;
-        if (_battery.pct < 0) {
-            // Desktop / nessuna batteria rilevata
-            batVal = @"AC";
-            batCol = colMid;
-        } else {
-            NSString *icon = _battery.charging ? @"⚡ " : @"";
-            NSString *timeStr = (!_battery.onAC && _battery.minutesLeft > 0)
-                ? [NSString stringWithFormat:@"  %dh%02d",
-                   _battery.minutesLeft / 60, _battery.minutesLeft % 60]
-                : @"";
-            batVal = [NSString stringWithFormat:@"%@%d%%%@",
-                      icon, _battery.pct, timeStr];
-            batCol = _battery.onAC       ? colGreen
-                   : (_battery.pct > 20) ? colGreen
-                   : (_battery.pct > 10) ? colOrange : colRed;
-        }
-        row(@"Batteria", batVal, batCol);
+        sysBar(@"CPU", _sample.cpu_pct, cpuProcPct, _topCpu.name);
+        sysBar(@"RAM", _sample.ram_pct, ramProcPct, _topRam.name);
+        batBar();
     }
 
     // ---- TRAFFICO ----
